@@ -1,0 +1,89 @@
+# =========================
+# Dependencies
+# =========================
+node_modules/
+
+# =========================
+# Environment Files
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Firebase Service Account
+# =========================
+firebase-service-account.json
+serviceAccountKey.json
+firebase-adminsdk*.json
+*firebase*.json
+
+# =========================
+# Logs
+# =========================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================
+# Runtime Files
+# =========================
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# =========================
+# Coverage
+# =========================
+coverage/
+.nyc_output/
+
+# =========================
+# Build Output
+# =========================
+dist/
+build/
+
+# =========================
+# Cache
+# =========================
+.cache/
+.tmp/
+.temp/
+
+# =========================
+# Uploaded User Files
+# =========================
+uploads/
+public/uploads/
+
+# =========================
+# Operating System Files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# IDE Files
+# =========================
+.vscode/
+.idea/
+*.iml
+
+# =========================
+# Git
+# =========================
+.git/
+
+# =========================
+# Optional
+# =========================
+*.zip
+*.tar
+*.gz
+*.rar
