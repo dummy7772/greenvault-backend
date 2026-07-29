@@ -55,11 +55,14 @@ async function ensureSecurityColumns() {
     }
 
     // user_sessions table
+    // NOTE: session_token stores a full signed JWT (sub, email, phone, role,
+    // sid, iat, exp claims), which routinely exceeds 255 characters. It's
+    // declared VARCHAR(512) here for fresh databases.
     await db.execute(`
       CREATE TABLE IF NOT EXISTS user_sessions (
         id          INT UNSIGNED     NOT NULL AUTO_INCREMENT,
         user_id     INT UNSIGNED     NOT NULL,
-        session_token VARCHAR(255)   NOT NULL,
+        session_token VARCHAR(512)   NOT NULL,
         device_name  VARCHAR(191)   NOT NULL DEFAULT 'Unknown Device',
         device_type  VARCHAR(20)    NOT NULL DEFAULT 'android',
         location     VARCHAR(191)   NOT NULL DEFAULT 'Unknown',
@@ -73,6 +76,24 @@ async function ensureSecurityColumns() {
         CONSTRAINT fk_sess_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
+
+    // Migration for databases where user_sessions already exists with the
+    // old, too-narrow VARCHAR(255) definition — CREATE TABLE IF NOT EXISTS
+    // above is a no-op on those, so widen it explicitly here.
+    const [sessTokenCol] = await db.execute(
+      `SELECT CHARACTER_MAXIMUM_LENGTH AS len
+         FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'user_sessions'
+          AND COLUMN_NAME  = 'session_token'
+        LIMIT 1`
+    );
+    if (sessTokenCol.length > 0 && sessTokenCol[0].len < 512) {
+      await db.execute(
+        `ALTER TABLE user_sessions MODIFY COLUMN session_token VARCHAR(512) NOT NULL`
+      );
+      console.log('[security-migration] Widened user_sessions.session_token to VARCHAR(512)');
+    }
 
     // login_history table
     await db.execute(`
