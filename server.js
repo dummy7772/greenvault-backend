@@ -27,6 +27,12 @@ const { runDailyRoi }  = require('./controllers/planController');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
+// Railway (and most PaaS hosts) put the app behind a reverse proxy, which
+// sets X-Forwarded-For. Express needs to be told to trust exactly one hop
+// so express-rate-limit can read the real client IP instead of throwing
+// ERR_ERL_UNEXPECTED_X_FORWARDED_FOR and mis-attributing all traffic.
+app.set('trust proxy', 1);
+
 // ── Global middleware ─────────────────────────────────────────────────────────
 
 app.use(cors({
