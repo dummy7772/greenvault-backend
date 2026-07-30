@@ -83,7 +83,14 @@ async function initSchema() {
 }
 
 // Verify connection and auto-init on startup
-pool.getConnection()
+//
+// `pool.ready` is exposed so server.js can `await` full DB + schema
+// readiness before calling app.listen() — see the "ROOT CAUSE" note in
+// server.js for why this matters (previously this chain ran fire-and-forget,
+// which is what caused intermittent "Unknown column 'member_id'" /
+// "Table 'roi_daily_credits' doesn't exist" errors on requests that landed
+// during the first few seconds/minutes after a fresh deploy).
+pool.ready = pool.getConnection()
   .then(async (conn) => {
     console.log('✅  MySQL connected');
     conn.release();
