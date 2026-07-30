@@ -22,7 +22,9 @@ const adminUsersRoutes   = require('./routes/adminUsers');
 const dashboardRoutes    = require('./routes/dashboard');
 const adminSettingsRoutes = require('./routes/adminSettings');
 const pushRoutes          = require('./routes/push');
-const { runDailyRoi }  = require('./controllers/planController');
+const { runDailyRoi, ensureSchema: ensurePlanSchema } = require('./controllers/planController');
+const { ensureMemberIdSchema } = require('./utils/memberId');
+const db = require('./config/db');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -118,7 +120,35 @@ function scheduleDailyRoi() {
 }
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🚀  GreenVault API running on http://localhost:${PORT}`);
-  scheduleDailyRoi();
+//
+// ROOT CAUSE (fixed): this used to be a bare `app.listen(PORT, ...)` call
+// that fired immediately on require, while config/db.js's schema.sql run,
+// utils/memberId.js's `users.member_id` column migration, and
+// planController.js's `roi_daily_credits` (and related) table creation all
+// ran as separate, unawaited, fire-and-forget promises in parallel.
+// Whichever request arrived first — a real login, a dashboard load, a
+// health check — could be served before one of those migrations had
+// actually finished, producing intermittent
+// "Unknown column 'member_id' in 'field list'" and
+// "Table 'roi_daily_credits' doesn't exist" errors that appeared to
+// "randomly" happen a few minutes into a fresh deploy.
+//
+// Fix: explicitly await every schema-readiness step below BEFORE the HTTP
+// server starts accepting any connections, so by the time app.listen()'s
+// callback fires, every table/column every route depends on is guaranteed
+// to already exist.
+async function start() {
+  await db.ready;              // MySQL connection + config/schema.sql
+  await ensureMemberIdSchema(); // users.member_id column + unique index
+  await ensurePlanSchema();     // investment_plans/roi_daily_credits/etc.
+
+  app.listen(PORT, () => {
+    console.log(`🚀  GreenVault API running on http://localhost:${PORT}`);
+    scheduleDailyRoi();
+  });
+}
+
+start().catch((err) => {
+  console.error('❌  Startup failed:', err.message);
+  process.exit(1);
 });
