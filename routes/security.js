@@ -5,6 +5,11 @@ const { authenticate } = require('../middleware/auth');
 const {
   changePassword,
   changePasswordRules,
+  getPasswordChangeStatus,
+  verifyCurrentPassword,
+  verifyCurrentPasswordRules,
+  updatePassword,
+  updatePasswordRules,
   send2faOtp,
   verify2faOtp,
   disable2fa,
@@ -24,6 +29,16 @@ router.use(authenticate);
 // ── Change Password (PIN) ────────────────────────────────────────────────────
 // POST /api/security/change-password
 router.post('/change-password', changePasswordRules, changePassword);
+
+// ── Login Credentials → Change Password ──────────────────────────────────────
+// GET  /api/security/password/status  — resume lock countdown / attempts left
+router.get('/password/status', getPasswordChangeStatus);
+
+// POST /api/security/password/verify  — step 1: check current password
+router.post('/password/verify', verifyCurrentPasswordRules, verifyCurrentPassword);
+
+// POST /api/security/password/update  — step 2: set the new password
+router.post('/password/update', updatePasswordRules, updatePassword);
 
 // ── Two-Factor Authentication ────────────────────────────────────────────────
 // GET  /api/security/2fa/status
