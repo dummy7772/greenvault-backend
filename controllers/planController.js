@@ -1598,4 +1598,5 @@ module.exports = {
   runDailyRoi,
   backfillMissedRoi,
   accrueRoiForPlan,
+  ensureSchema,
 };
