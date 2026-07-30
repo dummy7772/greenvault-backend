@@ -94,6 +94,7 @@ app.use('/api/users',          usersRoutes);
 app.use('/api/admin/users',    adminUsersRoutes);
 app.use('/api/admin/settings', adminSettingsRoutes);
 app.use('/api/dashboard',      dashboardRoutes);
+app.use('/api/push',           pushRoutes);
 
 // Health check
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
