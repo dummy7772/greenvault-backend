@@ -7,6 +7,11 @@ const { createNotification } = require('./notificationController');
 
 const SALT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12');
 
+// ── Login Credentials → Change Password policy ─────────────────────────────
+const PASSWORD_CHANGE_MAX_ATTEMPTS = 5;
+const PASSWORD_CHANGE_LOCK_MS = 5 * 60 * 1000;      // 5 minutes
+const PASSWORD_CHANGE_VERIFIED_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
 // ── One-time migration ────────────────────────────────────────────────────────
 let _migrated = false;
 
@@ -36,6 +41,31 @@ async function ensureSecurityColumns() {
         // device) is signed out.
         col: 'active_session_id',
         sql: `ALTER TABLE users ADD COLUMN active_session_id VARCHAR(64) DEFAULT NULL`,
+      },
+      {
+        // Login Credentials → Change Password flow: number of consecutive
+        // incorrect "current password" attempts since the last success or
+        // lockout. Reset to 0 on a correct verification and whenever a
+        // lockout window (see password_change_locked_until) expires.
+        col: 'password_change_failed_attempts',
+        sql: `ALTER TABLE users ADD COLUMN password_change_failed_attempts TINYINT UNSIGNED NOT NULL DEFAULT 0`,
+      },
+      {
+        // Set once password_change_failed_attempts reaches the 5-attempt
+        // cap. While in the future, POST /api/security/password/verify is
+        // rejected with 423 and the remaining lock seconds so the app can
+        // show a countdown. Cleared automatically once it elapses.
+        col: 'password_change_locked_until',
+        sql: `ALTER TABLE users ADD COLUMN password_change_locked_until TIMESTAMP NULL DEFAULT NULL`,
+      },
+      {
+        // Short-lived proof that the account owner just supplied the
+        // correct current password. Set by POST /api/security/password/verify
+        // on success and required by POST /api/security/password/update —
+        // this is what lets the "New Password" page be a separate step/
+        // screen from re-entering the current password.
+        col: 'password_change_verified_until',
+        sql: `ALTER TABLE users ADD COLUMN password_change_verified_until TIMESTAMP NULL DEFAULT NULL`,
       },
     ];
 
@@ -167,6 +197,243 @@ async function changePassword(req, res) {
     return ok(res, 'Password changed successfully');
   } catch (err) {
     console.error('[changePassword]', err);
+    return fail(res, 'Failed to change password. Please try again.', 500);
+  }
+}
+
+// ── GET /api/security/password/status ────────────────────────────────────────
+// Lets the app resume the correct UI (locked countdown vs. remaining
+// attempts) if the user re-opens Change Password after backgrounding/
+// killing the app mid-lockout.
+
+async function getPasswordChangeStatus(req, res) {
+  await ensureSecurityColumns();
+
+  try {
+    const [rows] = await db.execute(
+      `SELECT password_change_failed_attempts, password_change_locked_until
+         FROM users WHERE id = ? LIMIT 1`,
+      [req.user.sub]
+    );
+
+    if (rows.length === 0) {
+      return fail(res, 'User not found', 404);
+    }
+
+    const user = rows[0];
+    const lockedUntil = user.password_change_locked_until
+      ? new Date(user.password_change_locked_until)
+      : null;
+    const now = new Date();
+
+    if (lockedUntil && lockedUntil > now) {
+      return ok(res, 'Change Password is temporarily locked', {
+        locked: true,
+        remaining_seconds: Math.ceil((lockedUntil - now) / 1000),
+        remaining_attempts: 0,
+      });
+    }
+
+    return ok(res, 'Change Password status fetched', {
+      locked: false,
+      remaining_seconds: 0,
+      remaining_attempts:
+        PASSWORD_CHANGE_MAX_ATTEMPTS - (user.password_change_failed_attempts || 0),
+    });
+  } catch (err) {
+    console.error('[getPasswordChangeStatus]', err);
+    return fail(res, 'Failed to fetch status.', 500);
+  }
+}
+
+// ── POST /api/security/password/verify ───────────────────────────────────────
+// Step 1 of Change Password: confirm the account owner knows the current
+// login password before letting them choose a new one. Tracks failed
+// attempts server-side (max 5) and locks this feature for 5 minutes once
+// the cap is hit — independent of the login screen's own rate limiting.
+
+async function verifyCurrentPassword(req, res) {
+  await ensureSecurityColumns();
+
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return fail(res, 'Validation failed', 422, errors.array());
+  }
+
+  const { current_password } = req.body;
+
+  try {
+    const [rows] = await db.execute(
+      `SELECT id, password_hash, password_change_failed_attempts,
+              password_change_locked_until
+         FROM users WHERE id = ? LIMIT 1`,
+      [req.user.sub]
+    );
+
+    if (rows.length === 0) {
+      return fail(res, 'User not found', 404);
+    }
+
+    const user = rows[0];
+    const now = new Date();
+    let failedAttempts = user.password_change_failed_attempts || 0;
+    const lockedUntil = user.password_change_locked_until
+      ? new Date(user.password_change_locked_until)
+      : null;
+
+    // Still inside an active lockout window — reject without even checking
+    // the password so a locked-out attacker can't keep probing.
+    if (lockedUntil && lockedUntil > now) {
+      return res.status(423).json({
+        success: false,
+        message: 'Too many incorrect attempts. Please try again later.',
+        data: {
+          locked: true,
+          remaining_seconds: Math.ceil((lockedUntil - now) / 1000),
+          remaining_attempts: 0,
+        },
+      });
+    }
+
+    // A previous lockout has elapsed — clear it before evaluating this
+    // attempt so the user gets a fresh set of tries.
+    if (lockedUntil && lockedUntil <= now) {
+      failedAttempts = 0;
+    }
+
+    const valid = await bcrypt.compare(current_password, user.password_hash);
+
+    if (!valid) {
+      failedAttempts += 1;
+
+      if (failedAttempts >= PASSWORD_CHANGE_MAX_ATTEMPTS) {
+        const newLockedUntil = new Date(Date.now() + PASSWORD_CHANGE_LOCK_MS);
+        await db.execute(
+          `UPDATE users
+             SET password_change_failed_attempts = 0,
+                 password_change_locked_until = ?
+             WHERE id = ?`,
+          [newLockedUntil, user.id]
+        );
+        return res.status(423).json({
+          success: false,
+          message: 'Too many incorrect attempts. Change Password has been locked for 5 minutes.',
+          data: {
+            locked: true,
+            remaining_seconds: Math.ceil(PASSWORD_CHANGE_LOCK_MS / 1000),
+            remaining_attempts: 0,
+          },
+        });
+      }
+
+      await db.execute(
+        `UPDATE users
+           SET password_change_failed_attempts = ?,
+               password_change_locked_until = NULL
+           WHERE id = ?`,
+        [failedAttempts, user.id]
+      );
+
+      return res.status(401).json({
+        success: false,
+        message: 'Current password is incorrect.',
+        data: {
+          locked: false,
+          remaining_seconds: 0,
+          remaining_attempts: PASSWORD_CHANGE_MAX_ATTEMPTS - failedAttempts,
+        },
+      });
+    }
+
+    // Correct password — reset the attempt counter and open a short
+    // verification window for the "New Password" step.
+    const verifiedUntil = new Date(Date.now() + PASSWORD_CHANGE_VERIFIED_WINDOW_MS);
+    await db.execute(
+      `UPDATE users
+         SET password_change_failed_attempts = 0,
+             password_change_locked_until = NULL,
+             password_change_verified_until = ?
+         WHERE id = ?`,
+      [verifiedUntil, user.id]
+    );
+
+    return ok(res, 'Password verified', {
+      verified: true,
+      verified_window_seconds: Math.ceil(PASSWORD_CHANGE_VERIFIED_WINDOW_MS / 1000),
+    });
+  } catch (err) {
+    console.error('[verifyCurrentPassword]', err);
+    return fail(res, 'Failed to verify password. Please try again.', 500);
+  }
+}
+
+// ── POST /api/security/password/update ────────────────────────────────────────
+// Step 2 of Change Password: set the new login password. Only allowed
+// within the short window opened by a successful verifyCurrentPassword
+// call above — this is what lets the New Password page rely on Step 1
+// having already happened, without resubmitting the current password.
+
+async function updatePassword(req, res) {
+  await ensureSecurityColumns();
+
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return fail(res, 'Validation failed', 422, errors.array());
+  }
+
+  const { new_password, confirm_password } = req.body;
+
+  if (new_password !== confirm_password) {
+    return fail(res, 'New password and confirmation do not match', 400);
+  }
+
+  try {
+    const [rows] = await db.execute(
+      `SELECT id, password_hash, password_change_verified_until
+         FROM users WHERE id = ? LIMIT 1`,
+      [req.user.sub]
+    );
+
+    if (rows.length === 0) {
+      return fail(res, 'User not found', 404);
+    }
+
+    const user = rows[0];
+    const verifiedUntil = user.password_change_verified_until
+      ? new Date(user.password_change_verified_until)
+      : null;
+
+    if (!verifiedUntil || verifiedUntil <= new Date()) {
+      return fail(res, 'Verification expired. Please re-enter your current password.', 401);
+    }
+
+    const sameAsOld = await bcrypt.compare(new_password, user.password_hash);
+    if (sameAsOld) {
+      return fail(res, 'New password must be different from your current password.', 400);
+    }
+
+    const newHash = await bcrypt.hash(new_password, SALT_ROUNDS);
+
+    await db.execute(
+      `UPDATE users
+         SET password_hash = ?,
+             password_change_verified_until = NULL,
+             password_change_failed_attempts = 0,
+             password_change_locked_until = NULL
+         WHERE id = ?`,
+      [newHash, user.id]
+    );
+
+    createNotification(
+      user.id,
+      'system',
+      'Password Changed',
+      'Your login password was changed successfully. If this wasn\'t you, please contact support immediately.'
+    ).catch(e => console.error('[updatePassword] notify error:', e.message));
+
+    return ok(res, 'Password changed successfully');
+  } catch (err) {
+    console.error('[updatePassword]', err);
     return fail(res, 'Failed to change password. Please try again.', 500);
   }
 }
@@ -557,10 +824,33 @@ const changePasswordRules = [
     .notEmpty().withMessage('Please confirm the new password'),
 ];
 
+// Login Credentials → Change Password (step 1: verify current password)
+const verifyCurrentPasswordRules = [
+  body('current_password')
+    .notEmpty().withMessage('Current password is required'),
+];
+
+// Login Credentials → Change Password (step 2: set new password)
+// Mirrors the registration screen's password policy (min 8 chars, letters + numbers)
+// so the requirement is identical everywhere it's enforced in the app.
+const updatePasswordRules = [
+  body('new_password')
+    .notEmpty().withMessage('New password is required')
+    .isLength({ min: 8 }).withMessage('New password must be at least 8 characters')
+    .matches(/(?=.*[A-Za-z])(?=.*\d)/).withMessage('New password must contain letters and numbers'),
+  body('confirm_password')
+    .notEmpty().withMessage('Please confirm the new password'),
+];
+
 module.exports = {
   ensureSecurityColumns,
   changePassword,
   changePasswordRules,
+  getPasswordChangeStatus,
+  verifyCurrentPassword,
+  verifyCurrentPasswordRules,
+  updatePassword,
+  updatePasswordRules,
   send2faOtp,
   verify2faOtp,
   disable2fa,
