@@ -144,6 +144,12 @@ async function sendPushToUser(userId, { title, body, data = {} }) {
           sound: 'default',
           defaultSound: true,
           defaultVibrateTimings: true,
+          // Status-bar icon while the app is backgrounded/terminated (FCM
+          // auto-displays the notification itself in this state, using
+          // this exact resource — must be the monochrome drawable, not the
+          // full-color launcher icon, or Android shows a flat grey square).
+          icon: 'ic_stat_notification',
+          color: '#108156',
         },
       },
       apns: {
