@@ -64,6 +64,35 @@ async function ensureMemberIdSchema() {
   }
 }
 
+// ── Self-healing guard ───────────────────────────────────────────────────
+// Same fix as the referral-code sequence table (utils/referralCode.js):
+// previously this assumed config/schema.sql had already created
+// `member_id_sequence` before assignMemberId() ever ran. If that table was
+// missing on a given deploy, the SELECT ... FOR UPDATE below threw,
+// registration silently swallowed the error, and the user was left with
+// member_id = NULL. assignMemberId() now ensures its own table exists
+// every time it runs, independent of schema.sql.
+let _seqTableReady = false;
+async function ensureSequenceTable() {
+  if (_seqTableReady) return;
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS member_id_sequence (
+      name        VARCHAR(50)  NOT NULL,
+      next_value  INT UNSIGNED NOT NULL,
+      PRIMARY KEY (name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+  await db.execute(
+    `INSERT INTO member_id_sequence (name, next_value)
+     SELECT ?, 1112
+     WHERE NOT EXISTS (
+       SELECT 1 FROM member_id_sequence WHERE name = ?
+     )`,
+    [SEQUENCE_NAME, SEQUENCE_NAME]
+  );
+  _seqTableReady = true;
+}
+
 /**
  * Atomically claims the next MT number and writes it onto the given user's
  * row. Intended to be called exactly once, right after a brand-new user is
@@ -74,6 +103,8 @@ async function ensureMemberIdSchema() {
  * Returns the new member ID string (e.g. "MT1112").
  */
 async function assignMemberId(userId) {
+  await ensureSequenceTable();
+
   const conn = await db.getConnection();
   try {
     await conn.beginTransaction();
