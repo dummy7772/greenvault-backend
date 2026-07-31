@@ -1,10 +1,22 @@
 // utils/pushService.js
 //
 // Push notification delivery via Firebase Cloud Messaging (FCM), plus the
-// device_tokens table that maps a user to the FCM registration token(s) of
-// every device they're signed in on. A user may have more than one device
-// token (phone + tablet, etc.) — every push goes to all of them, the same
-// way WhatsApp/most apps notify every linked device.
+// device_tokens table that maps a user to their currently active device's
+// FCM registration token.
+//
+// ── Single Device Login alignment ──────────────────────────────────────────
+// This app enforces Single Device Login (see authController.issueSessionAndToken
+// and middleware/auth.js): only one device may be signed in per account at a
+// time. device_tokens now mirrors that exactly — at most one row per user_id.
+// registerDeviceToken() below always deletes any other token(s) already on
+// file for that user before saving the new one, and
+// clearTokensForUser() is called by authController the instant a new login
+// succeeds, so the previous device's token is removed immediately — it does
+// not linger until that old device happens to call register-token again (it
+// never will; its session is already invalidated) or unregister itself
+// (it can't — /api/push/unregister-token requires a valid, non-invalidated
+// session). This is what guarantees a logged-out device stops receiving
+// pushes right away, even while still offline.
 //
 // NOTE: no FOREIGN KEY constraint on user_id, matching the same pattern
 // already used in notifications/security/kyc tables in this codebase — a
@@ -41,10 +53,31 @@ async function ensureDeviceTokensTable() {
 ensureDeviceTokensTable();
 
 /**
+ * Deletes every device_tokens row for a user, with no exceptions. Called by
+ * authController.issueSessionAndToken() the instant a login/registration
+ * mints a brand-new active_session_id — i.e. the moment a previous device
+ * (if any) is superseded. This is what makes the previous device stop
+ * receiving pushes immediately, rather than waiting for the new device to
+ * finish its own register-token call (which could be delayed, e.g. by the
+ * notification-permission prompt on a slow real device).
+ */
+async function clearTokensForUser(userId) {
+  await ensureDeviceTokensTable();
+  try {
+    await db.execute('DELETE FROM device_tokens WHERE user_id = ?', [userId]);
+  } catch (err) {
+    console.error('[pushService] clearTokensForUser error:', err.message);
+  }
+}
+
+/**
  * Registers (or refreshes) an FCM token for a user. Called by the app right
  * after login and on every app start / token-refresh event, so a rotated
  * FCM token is always kept current.
  *
+ * Enforces "at most one active token per user" (Single Device Login): any
+ * OTHER token already on file for this user_id is deleted first, so this
+ * newly-registering device becomes the sole recipient of future pushes.
  * Also removes this exact token from any OTHER user_id it was previously
  * registered under — handles the case where a different account logged in
  * on the same physical device earlier (shared/reset device); otherwise that
@@ -58,6 +91,11 @@ async function registerDeviceToken(userId, fcmToken, platform = 'android') {
     await db.execute(
       'DELETE FROM device_tokens WHERE fcm_token = ? AND user_id != ?',
       [fcmToken, userId]
+    );
+    // Single Device Login: this user_id keeps exactly one token — theirs.
+    await db.execute(
+      'DELETE FROM device_tokens WHERE user_id = ? AND fcm_token != ?',
+      [userId, fcmToken]
     );
     await db.execute(
       `INSERT INTO device_tokens (user_id, fcm_token, platform)
@@ -183,6 +221,7 @@ module.exports = {
   ensureDeviceTokensTable,
   registerDeviceToken,
   unregisterDeviceToken,
+  clearTokensForUser,
   getTokensForUser,
   sendPushToUser,
 };
