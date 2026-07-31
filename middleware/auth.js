@@ -57,7 +57,7 @@ async function authenticate(req, res, next) {
     if (!decoded.sid || !currentSessionId || decoded.sid !== currentSessionId) {
       return res.status(401).json({
         success: false,
-        message: 'Your account has been logged in on another device.',
+        message: 'Your account has been logged in on another device. Please log in again.',
         code: 'SESSION_INVALIDATED',
       });
     }
