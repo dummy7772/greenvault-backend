@@ -35,6 +35,42 @@ const db = require('../config/db');
 const SEQUENCE_NAME = 'user_referral_code';
 const MAX_ATTEMPTS  = 1000;
 
+// ── Self-healing guard ───────────────────────────────────────────────────
+// ROOT CAUSE fixed here: previously this module assumed config/schema.sql
+// had already created `referral_code_sequence` before assignReferralCode()
+// ever ran. On a deploy where that table was missing (e.g. schema.sql not
+// yet redeployed), the SELECT ... FOR UPDATE below threw, registration
+// silently swallowed the error (by design, so a DB hiccup never blocks
+// signup), and the user was left with my_referral_code = NULL — which then
+// caused the legacy GV-format fallback in referralController.js to kick in
+// and permanently assign an old-format code to a brand-new user.
+//
+// To make this impossible going forward, assignReferralCode() now ensures
+// its own table exists (CREATE TABLE IF NOT EXISTS + seed-if-missing) every
+// time it runs, independent of whether schema.sql has been executed. This
+// mirrors the same self-healing pattern already used for referral_transactions
+// and the users.* referral columns in controllers/referralController.js.
+let _tableReady = false;
+async function ensureSequenceTable() {
+  if (_tableReady) return;
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS referral_code_sequence (
+      name        VARCHAR(50)  NOT NULL,
+      next_value  INT UNSIGNED NOT NULL,
+      PRIMARY KEY (name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+  await db.execute(
+    `INSERT INTO referral_code_sequence (name, next_value)
+     SELECT ?, 1
+     WHERE NOT EXISTS (
+       SELECT 1 FROM referral_code_sequence WHERE name = ?
+     )`,
+    [SEQUENCE_NAME, SEQUENCE_NAME]
+  );
+  _tableReady = true;
+}
+
 /**
  * Returns the first letter of a name string, uppercased.
  * Falls back to 'X' when the name is empty, null, or whitespace-only,
@@ -82,6 +118,8 @@ function buildCode(seq, firstName, lastName) {
  * @param {string} lastName   - User's last name  (for the second initial; 'X' if blank)
  */
 async function assignReferralCode(userId, firstName, lastName) {
+  await ensureSequenceTable();
+
   const conn = await db.getConnection();
   try {
     await conn.beginTransaction();
