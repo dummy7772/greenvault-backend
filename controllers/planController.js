@@ -292,7 +292,6 @@ async function _runSchemaMigration() {
     console.error('[plan] schema migration failed:', err.message);
   }
 }
-ensureSchema();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function normalisePlanType(raw) {
