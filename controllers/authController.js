@@ -11,6 +11,7 @@ const { isEmailOtpVerified, clearVerifiedEmailOtp } = require('./emailOtpControl
 const { ensureSecurityColumns } = require('./securityController');
 const { ensureMemberIdSchema, assignMemberId } = require('../utils/memberId');
 const { assignReferralCode } = require('../utils/referralCode');
+const { clearTokensForUser } = require('../utils/pushService');
 
 const SALT_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS || '12');
 const LOGIN_OTP_EXPIRY_MINUTES = 5;
@@ -78,6 +79,17 @@ async function issueLoginOtp(userId) {
  * exactly what "kicks out" the previous device: middleware/auth.js checks
  * every request's `sid` against this column, and the old token's `sid` will
  * no longer match once this runs.
+ *
+ * Also immediately clears any FCM token(s) on file for this user (see
+ * pushService.clearTokensForUser). Without this, a previously logged-in
+ * device would keep receiving push notifications indefinitely — the
+ * session/API check above only blocks that old device's own API calls, it
+ * does nothing to stop the server from still pushing to it, since push
+ * delivery is server-initiated and never passes through middleware/auth.js.
+ * This runs unconditionally on every login/registration, so the new
+ * device's own register-token call (made moments later) is what repopulates
+ * the table with exactly its token — the previous device is never in the
+ * table to receive anything in between, even while it's offline.
  */
 async function issueSessionAndToken(user) {
   const sessionId = crypto.randomUUID();
@@ -85,6 +97,7 @@ async function issueSessionAndToken(user) {
     'UPDATE users SET active_session_id = ? WHERE id = ?',
     [sessionId, user.id]
   );
+  await clearTokensForUser(user.id);
   return signToken(user, sessionId);
 }
 
