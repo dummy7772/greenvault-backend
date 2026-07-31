@@ -67,6 +67,32 @@ async function ensureSecurityColumns() {
         col: 'password_change_verified_until',
         sql: `ALTER TABLE users ADD COLUMN password_change_verified_until TIMESTAMP NULL DEFAULT NULL`,
       },
+      {
+        // Account-level Login PIN (the GPay-style 4-digit app-lock PIN).
+        // Previously this only ever lived in each device's SharedPreferences
+        // (`app_pin_<userId>`), so every new device had to set it up again
+        // from scratch. Storing a bcrypt hash here makes the PIN a property
+        // of the *account* - any device can verify against it, and any
+        // device that sets/changes it updates the same row so every other
+        // device picks up the change.
+        col: 'login_pin_hash',
+        sql: `ALTER TABLE users ADD COLUMN login_pin_hash VARCHAR(255) DEFAULT NULL`,
+      },
+      {
+        // Account-level Withdrawal PIN, mirrors login_pin_hash above but
+        // for the separate 4-digit PIN required to confirm withdrawals.
+        col: 'withdrawal_pin_hash',
+        sql: `ALTER TABLE users ADD COLUMN withdrawal_pin_hash VARCHAR(255) DEFAULT NULL`,
+      },
+      {
+        // Account-level 'Biometric Login' preference. The biometric
+        // credential + remembered quick-login token still live on-device
+        // (they physically can't be synced), but whether the *setting* is
+        // turned on is now account-wide, so toggling it on one device is
+        // reflected as 'on' everywhere else too.
+        col: 'biometric_enabled',
+        sql: `ALTER TABLE users ADD COLUMN biometric_enabled TINYINT(1) NOT NULL DEFAULT 0`,
+      },
     ];
 
     for (const { col, sql } of columns) {
@@ -842,6 +868,167 @@ const updatePasswordRules = [
     .notEmpty().withMessage('Please confirm the new password'),
 ];
 
+// ── Account-level Login PIN / Withdrawal PIN / Biometric Login ──────────────
+const PIN_RULES_MESSAGE = 'PIN must be exactly 4 digits';
+
+function _isValidPin(pin) {
+  return typeof pin === 'string' && /^\d{4}$/.test(pin);
+}
+
+async function getPinsStatus(req, res) {
+  await ensureSecurityColumns();
+  try {
+    const [rows] = await db.execute(
+      `SELECT login_pin_hash, withdrawal_pin_hash, biometric_enabled
+         FROM users WHERE id = ? LIMIT 1`,
+      [req.user.sub]
+    );
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+    const user = rows[0];
+    return ok(res, 'Pin/biometric status fetched', {
+      login_pin_set: !!user.login_pin_hash,
+      withdrawal_pin_set: !!user.withdrawal_pin_hash,
+      biometric_enabled: user.biometric_enabled === 1,
+    });
+  } catch (err) {
+    console.error('[getPinsStatus]', err);
+    return fail(res, 'Failed to fetch pin status.', 500);
+  }
+}
+
+async function setLoginPin(req, res) {
+  await ensureSecurityColumns();
+  const { current_pin, new_pin } = req.body;
+  if (!_isValidPin(new_pin)) return fail(res, PIN_RULES_MESSAGE, 422);
+  try {
+    const [rows] = await db.execute(
+      'SELECT id, login_pin_hash FROM users WHERE id = ? LIMIT 1',
+      [req.user.sub]
+    );
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+    const user = rows[0];
+    if (user.login_pin_hash) {
+      if (!_isValidPin(current_pin)) return fail(res, 'Current PIN is required', 422);
+      const valid = await bcrypt.compare(current_pin, user.login_pin_hash);
+      if (!valid) return fail(res, 'Current PIN is incorrect', 401);
+    }
+    const newHash = await bcrypt.hash(new_pin, SALT_ROUNDS);
+    await db.execute('UPDATE users SET login_pin_hash = ? WHERE id = ?', [newHash, user.id]);
+    createNotification(
+      user.id, 'system', 'Login PIN Updated',
+      'Your Login PIN was changed and is now active on all your devices. If this wasn\'t you, please contact support immediately.'
+    ).catch(e => console.error('[setLoginPin] notify error:', e.message));
+    return ok(res, user.login_pin_hash ? 'Login PIN changed successfully' : 'Login PIN set successfully');
+  } catch (err) {
+    console.error('[setLoginPin]', err);
+    return fail(res, 'Failed to save Login PIN. Please try again.', 500);
+  }
+}
+
+async function verifyLoginPin(req, res) {
+  await ensureSecurityColumns();
+  const { pin } = req.body;
+  if (!_isValidPin(pin)) return fail(res, PIN_RULES_MESSAGE, 422);
+  try {
+    const [rows] = await db.execute(
+      'SELECT login_pin_hash FROM users WHERE id = ? LIMIT 1',
+      [req.user.sub]
+    );
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+    const hash = rows[0].login_pin_hash;
+    if (!hash) return ok(res, 'No Login PIN set on this account', { valid: false, pin_set: false });
+    const valid = await bcrypt.compare(pin, hash);
+    return ok(res, valid ? 'PIN verified' : 'Incorrect PIN', { valid, pin_set: true });
+  } catch (err) {
+    console.error('[verifyLoginPin]', err);
+    return fail(res, 'Failed to verify PIN. Please try again.', 500);
+  }
+}
+
+async function setWithdrawalPin(req, res) {
+  await ensureSecurityColumns();
+  const { current_pin, new_pin } = req.body;
+  if (!_isValidPin(new_pin)) return fail(res, PIN_RULES_MESSAGE, 422);
+  try {
+    const [rows] = await db.execute(
+      'SELECT id, withdrawal_pin_hash FROM users WHERE id = ? LIMIT 1',
+      [req.user.sub]
+    );
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+    const user = rows[0];
+    if (user.withdrawal_pin_hash) {
+      if (!_isValidPin(current_pin)) return fail(res, 'Current withdrawal PIN is required', 422);
+      const valid = await bcrypt.compare(current_pin, user.withdrawal_pin_hash);
+      if (!valid) return fail(res, 'Current withdrawal PIN is incorrect', 401);
+    }
+    const newHash = await bcrypt.hash(new_pin, SALT_ROUNDS);
+    await db.execute('UPDATE users SET withdrawal_pin_hash = ? WHERE id = ?', [newHash, user.id]);
+    createNotification(
+      user.id, 'system', 'Withdrawal PIN Updated',
+      'Your Withdrawal PIN was changed and is now active on all your devices. If this wasn\'t you, please contact support immediately.'
+    ).catch(e => console.error('[setWithdrawalPin] notify error:', e.message));
+    return ok(res, user.withdrawal_pin_hash ? 'Withdrawal PIN changed successfully' : 'Withdrawal PIN set successfully');
+  } catch (err) {
+    console.error('[setWithdrawalPin]', err);
+    return fail(res, 'Failed to save withdrawal PIN. Please try again.', 500);
+  }
+}
+
+async function verifyWithdrawalPinRemote(req, res) {
+  await ensureSecurityColumns();
+  const { pin } = req.body;
+  if (!_isValidPin(pin)) return fail(res, PIN_RULES_MESSAGE, 422);
+  try {
+    const [rows] = await db.execute(
+      'SELECT withdrawal_pin_hash FROM users WHERE id = ? LIMIT 1',
+      [req.user.sub]
+    );
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+    const hash = rows[0].withdrawal_pin_hash;
+    if (!hash) return ok(res, 'No withdrawal PIN set on this account', { valid: false, pin_set: false });
+    const valid = await bcrypt.compare(pin, hash);
+    return ok(res, valid ? 'PIN verified' : 'Incorrect PIN', { valid, pin_set: true });
+  } catch (err) {
+    console.error('[verifyWithdrawalPinRemote]', err);
+    return fail(res, 'Failed to verify withdrawal PIN. Please try again.', 500);
+  }
+}
+
+async function getBiometricStatus(req, res) {
+  await ensureSecurityColumns();
+  try {
+    const [rows] = await db.execute(
+      'SELECT biometric_enabled FROM users WHERE id = ? LIMIT 1',
+      [req.user.sub]
+    );
+    if (rows.length === 0) return fail(res, 'User not found', 404);
+    return ok(res, 'Biometric status fetched', {
+      biometric_enabled: rows[0].biometric_enabled === 1,
+    });
+  } catch (err) {
+    console.error('[getBiometricStatus]', err);
+    return fail(res, 'Failed to fetch biometric status.', 500);
+  }
+}
+
+async function setBiometricEnabled(req, res) {
+  await ensureSecurityColumns();
+  const { enabled } = req.body;
+  if (typeof enabled !== 'boolean') return fail(res, '"enabled" must be true or false', 422);
+  try {
+    await db.execute('UPDATE users SET biometric_enabled = ? WHERE id = ?', [enabled ? 1 : 0, req.user.sub]);
+    createNotification(
+      req.user.sub, 'system',
+      enabled ? 'Biometric Login Enabled' : 'Biometric Login Disabled',
+      enabled ? 'Biometric login was turned on for your account.' : 'Biometric login was turned off for your account.'
+    ).catch(e => console.error('[setBiometricEnabled] notify error:', e.message));
+    return ok(res, `Biometric login ${enabled ? 'enabled' : 'disabled'} successfully`, { biometric_enabled: enabled });
+  } catch (err) {
+    console.error('[setBiometricEnabled]', err);
+    return fail(res, 'Failed to update biometric setting. Please try again.', 500);
+  }
+}
+
 module.exports = {
   ensureSecurityColumns,
   changePassword,
@@ -860,4 +1047,11 @@ module.exports = {
   revokeSession,
   getLoginHistory,
   recordLoginEvent,
+  getPinsStatus,
+  setLoginPin,
+  verifyLoginPin,
+  setWithdrawalPin,
+  verifyWithdrawalPinRemote,
+  getBiometricStatus,
+  setBiometricEnabled,
 };
