@@ -14,9 +14,33 @@ const PASSWORD_CHANGE_VERIFIED_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 
 // ── One-time migration ────────────────────────────────────────────────────────
 let _migrated = false;
+// In-flight promise guard. Without this, several requests arriving at once
+// (e.g. multiple logins within the same second right after a fresh deploy,
+// before `_migrated` has been set) would each see `_migrated === false` and
+// independently run the ENTIRE column-migration loop below. Two concurrent
+// runs can both see a given column as missing (via the same
+// INFORMATION_SCHEMA check) and both fire `ALTER TABLE ... ADD COLUMN`; the
+// loser gets a duplicate-column error, which is caught by the outer
+// try/catch and just logged — so `_migrated` never gets set to true, and
+// the request whose SELECT/UPDATE depends on that column can fail with
+// "Unknown column 'two_factor_enabled' in 'field list'" even though a
+// migration technically ran. Caching the in-flight promise means every
+// concurrent caller awaits the same single execution instead of starting
+// their own (same pattern as ensureSchema() in controllers/planController.js).
+let _migrationPromise = null;
 
 async function ensureSecurityColumns() {
   if (_migrated) return;
+  if (_migrationPromise) return _migrationPromise;
+  _migrationPromise = _runSecurityColumnsMigration();
+  try {
+    await _migrationPromise;
+  } finally {
+    _migrationPromise = null;
+  }
+}
+
+async function _runSecurityColumnsMigration() {
   try {
     const columns = [
       {
