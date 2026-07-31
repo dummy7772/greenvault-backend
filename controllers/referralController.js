@@ -2,6 +2,7 @@
 const db = require('../config/db');
 const { ok, fail } = require('../utils/response');
 const { createNotification } = require('./notificationController');
+const { assignReferralCode } = require('../utils/referralCode');
 
 // ── Invite-5 task target & one-time reward amount ─────────────────────────────
 const TASK_TARGET  = 5;
@@ -144,58 +145,29 @@ async function _runSchemaMigration() {
   }
 }
 
-// ── Legacy code generator — only used as a fallback for existing users ────────
-// Generates an old-format "GV" code (e.g. "GVABCD12") for users who
-// registered before the MT<seq><initials> format was introduced and somehow
-// still have no my_referral_code.  This code path is NEVER reached for
-// newly registered users — they always get an MT code via assignReferralCode()
-// in utils/referralCode.js, called once at registration time in
-// authController.js.
-function generateCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const prefix = 'GV';
-  const suffix = Array.from({ length: 6 }, () =>
-    chars[Math.floor(Math.random() * chars.length)]
-  ).join('');
-  return `${prefix}${suffix}`;
-}
-
-// Returns the user's existing my_referral_code.  If — and only if — the user
-// is an old account that was created before the MT-format assignment was
-// introduced AND still has no code at all, a legacy GV code is generated and
-// saved as a one-time fallback.  New users always have their MT code assigned
-// at registration (authController.js → assignReferralCode) so this fallback
-// path should never trigger for them.
+// Returns the user's existing my_referral_code. A user only ever reaches
+// this function's fallback branch if my_referral_code is NULL — meaning
+// either a genuinely old pre-MT-format account, or (previously) a brand-new
+// user whose registration-time assignReferralCode() call failed (e.g. a
+// missing referral_code_sequence table on a fresh deploy). Either way, the
+// fallback now calls the SAME MT<seq><FirstInitial><LastInitial> generator
+// used at registration (utils/referralCode.js → assignReferralCode), so a
+// legacy "GV" code can never be freshly assigned again — that generator is
+// retired. Users who already have ANY code (GV or MT) are returned as-is
+// and are never touched, preserving every existing user's code exactly.
 async function getOrCreateReferralCode(userId) {
   const [rows] = await db.execute(
-    'SELECT my_referral_code FROM users WHERE id = ? LIMIT 1',
+    'SELECT my_referral_code, first_name, last_name FROM users WHERE id = ? LIMIT 1',
     [userId]
   );
   const existing = rows[0]?.my_referral_code;
   if (existing) return existing;
 
-  // ── Legacy fallback — only for old users with no code ──────────────────
-  // Generate a GV-format code (not MT-format) so there is zero risk of
-  // accidentally overlapping with the MT<seq><initials> namespace used
-  // for new registrations.
-  let code;
-  let unique = false;
-  let attempts = 0;
-  while (!unique && attempts < 10) {
-    code = generateCode();
-    const [conflict] = await db.execute(
-      'SELECT id FROM users WHERE my_referral_code = ? LIMIT 1',
-      [code]
-    );
-    if (conflict.length === 0) unique = true;
-    attempts++;
-  }
-
-  await db.execute('UPDATE users SET my_referral_code = ? WHERE id = ?', [
-    code,
+  return assignReferralCode(
     userId,
-  ]);
-  return code;
+    rows[0]?.first_name || '',
+    rows[0]?.last_name || ''
+  );
 }
 
 // ── GET /api/referral/info ────────────────────────────────────────────────────
