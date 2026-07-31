@@ -19,6 +19,13 @@ const {
   revokeSession,
   getLoginHistory,
   recordLoginEvent,
+  getPinsStatus,
+  setLoginPin,
+  verifyLoginPin,
+  setWithdrawalPin,
+  verifyWithdrawalPinRemote,
+  getBiometricStatus,
+  setBiometricEnabled,
 } = require('../controllers/securityController');
 
 const router = express.Router();
@@ -69,5 +76,28 @@ router.get('/login-history', getLoginHistory);
 
 // POST /api/security/login-history/record
 router.post('/login-history/record', recordLoginEvent);
+
+// ── Account-level Login PIN / Withdrawal PIN / Biometric Login ──────────────
+// Fetched/updated by ANY device for the account, so a PIN or biometric
+// preference set on one device is available on all others instead of
+// having to be re-created per device.
+
+// GET  /api/security/pins/status — what's already configured on this account
+router.get('/pins/status', getPinsStatus);
+
+// POST /api/security/pin/login          — set/change the account Login PIN
+// POST /api/security/pin/login/verify   — verify an entered Login PIN
+router.post('/pin/login', setLoginPin);
+router.post('/pin/login/verify', verifyLoginPin);
+
+// POST /api/security/pin/withdrawal          — set/change the Withdrawal PIN
+// POST /api/security/pin/withdrawal/verify   — verify an entered Withdrawal PIN
+router.post('/pin/withdrawal', setWithdrawalPin);
+router.post('/pin/withdrawal/verify', verifyWithdrawalPinRemote);
+
+// GET  /api/security/biometric/status — account-wide biometric login flag
+// POST /api/security/biometric        — enable/disable biometric login
+router.get('/biometric/status', getBiometricStatus);
+router.post('/biometric', setBiometricEnabled);
 
 module.exports = router;
