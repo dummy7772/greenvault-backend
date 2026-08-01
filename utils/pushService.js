@@ -169,42 +169,46 @@ async function sendPushToUser(userId, { title, body, data = {} }) {
   for (const [key, value] of Object.entries(data)) {
     stringData[key] = value === null || value === undefined ? '' : String(value);
   }
-  // Title/body now travel inside the (all-string) FCM `data` payload
-  // instead of a top-level `notification` block.
+  // Title/body are duplicated into `data` as a fallback for the app's own
+  // foreground handler (see push_notification_service.dart), in addition
+  // to the top-level `notification` block below.
   //
-  // WHY: a top-level `notification` block is auto-displayed by Android
-  // itself whenever the app isn't in the foreground, and on a lot of real
-  // Android hardware (Xiaomi/MIUI, Vivo/Funtouch, Oppo/ColorOS, Realme UI —
-  // all very common) that OS-level auto-display is unreliable: it gets
-  // delayed, deduplicated, or silently dropped by the manufacturer's own
-  // battery/autostart restrictions unless the user has manually
-  // whitelisted the app — which is exactly the "works on the emulator,
-  // only some types arrive on a real phone" symptom this was causing.
-  // Every push this backend sends now takes the SAME path regardless of
-  // type: a high-priority data message, which the Flutter app always
-  // receives and displays itself via flutter_local_notifications — in the
-  // foreground through FirebaseMessaging.onMessage, and in the background
-  // /terminated state through firebaseMessagingBackgroundHandler (Android
-  // still spins up that background isolate for a high-priority data
-  // message even with the app fully killed). See
-  // lib/services/push_notification_service.dart on the frontend.
+  // IMPORTANT — do not remove the top-level `notification` block again:
+  // it is what lets Android auto-display the notification in the
+  // background/terminated state WITHOUT needing the app's Dart background
+  // isolate to run at all. A lot of real Android OEMs (Xiaomi/MIUI,
+  // Vivo/Funtouch, Oppo/ColorOS, Realme UI, etc.) restrict background
+  // isolate execution for apps that aren't manually whitelisted in their
+  // battery/autostart settings — a data-only message silently never
+  // arrives on such a device, while a `notification` block still shows up
+  // every time, since the OS itself (not app code) renders it. The app
+  // only needs to handle display itself for the ONE state the OS never
+  // auto-displays in: while the app is already open in the foreground.
   stringData.title = title || '';
   stringData.body  = body  || '';
 
   try {
     const response = await messaging.sendEachForMulticast({
       tokens,
+      notification: { title, body },
       data: stringData,
       android: {
-        // High priority is what wakes a killed/Doze'd app's background
-        // isolate to run firebaseMessagingBackgroundHandler and post the
-        // notification itself — this matters more now than it did with a
-        // `notification` block, since there's no OS auto-display to fall
-        // back on any more.
         priority: 'high',
+        notification: {
+          channelId: 'greenvault_notifications',
+          sound: 'default',
+          defaultSound: true,
+          defaultVibrateTimings: true,
+          // Status-bar icon while the app is backgrounded/terminated (FCM
+          // auto-displays the notification itself in this state, using
+          // this exact resource — must be the monochrome drawable, not the
+          // full-color launcher icon, or Android shows a flat grey square).
+          icon: 'ic_stat_notification',
+          color: '#108156',
+        },
       },
       apns: {
-        headers: { 'apns-priority': '5' },
+        headers: { 'apns-priority': '10' },
         payload: {
           aps: { sound: 'default', badge: 1, 'content-available': 1 },
         },
