@@ -10,7 +10,6 @@ const {
   getMyPlans,
   getPlanAmount,
   enrollPlan,
-  payInstalment,
   withdrawRoi,
   withdrawPrincipal,
   adminListPlans,
@@ -71,12 +70,14 @@ router.get('/plan-amount', authenticate, getPlanAmount);
 // POST /api/plans/enroll          — enroll in a plan (UPI / proof image)
 router.post('/enroll', authenticate, enrollPlan);
 
-// POST /api/plans/:id/pay         — submit next monthly instalment (UPI)
-router.post('/:id/pay', authenticate, payInstalment);
-
+// NOTE: Recurring monthly instalment payments have been permanently
+// removed. A plan is funded by exactly one payment, submitted at
+// enrollment (POST /enroll above) and reviewed once by admin — there is no
+// "pay next instalment" endpoint anymore.
+//
 // NOTE: Wallet-balance payment for investment plans (enroll-wallet /
 // pay-wallet) has been permanently removed. Wallet Balance must never be
-// used to create or pay for an investment plan — plans are only ever
+// used to create or pay for an investment plan — a plan is only ever
 // activated through the UPI/bank-transfer proof + admin-approval flow
 // above. Do not re-add wallet-funded enroll/pay routes.
 
