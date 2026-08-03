@@ -18,13 +18,13 @@ const PLAN_MONTHS = {
 };
 
 // ── Business rule: maximum single-transaction investment amount ───────────────
-// No single investment plan's monthly amount may exceed ₹100,000 (1 Lakh).
-// This only gates the amount chosen when a NEW plan is first enrolled
-// (enrollPlan) — that monthly_amount is then fixed for every subsequent
-// instalment of that plan (payInstalment reuses plan.monthly_amount as-is,
-// it never accepts a new user-entered amount), so this single check is the
-// only place a user-supplied plan amount is ever written. Existing plans
-// already enrolled before this rule keep their original amount untouched.
+// No single investment plan's one-time invested amount may exceed ₹100,000
+// (1 Lakh). This gates the amount chosen when a plan is enrolled
+// (enrollPlan) — that is the only payment the plan will ever receive (the
+// one-time investment model has no recurring instalments), so this single
+// check is the only place a user-supplied plan amount is ever written.
+// Existing plans already enrolled before this rule keep their original
+// amount untouched.
 const MAX_PLAN_AMOUNT = 100000;
 const MAX_AMOUNT_MESSAGE = 'The maximum allowed deposit or plan amount is ₹100,000.';
 
@@ -457,6 +457,9 @@ async function getMyPlans(req, res) {
         await accrueRoiForPlan(plan.id).catch(err =>
           console.error(`[roi] catch-up failed for plan #${plan.id}:`, err.message)
         );
+        await maturePlanIfDue(plan.id).catch(err =>
+          console.error(`[maturity] catch-up failed for plan #${plan.id}:`, err.message)
+        );
       }
     }
 
@@ -613,86 +616,6 @@ async function enrollPlan(req, res) {
     await conn.rollback();
     console.error('[plan] enrollPlan error:', err.message);
     return fail(res, 'Enrollment failed: ' + err.message, 500);
-  } finally {
-    conn.release();
-  }
-}
-
-// ── POST /api/plans/:id/pay ───────────────────────────────────────────────────
-async function payInstalment(req, res) {
-  await ensureSchema();
-  const userId = req.user.sub;
-  const planId = Number(req.params.id);
-  const { utr_id, proof_image, payment_method } = req.body;
-
-  // ── Hard block: Wallet Balance must never be used to pay a plan
-  // instalment (first month or any future month). See identical guard in
-  // enrollPlan() for rationale — kept even though no wallet-funded route
-  // currently calls this controller.
-  if (typeof payment_method === 'string' && payment_method.trim().toLowerCase() === 'wallet') {
-    return fail(res, 'Wallet Balance cannot be used to pay a plan instalment. Please pay via UPI/bank transfer.', 403);
-  }
-
-  if (!utr_id || utr_id.trim().length < 6) return fail(res, 'Invalid UTR ID.', 422);
-
-  const conn = await db.getConnection();
-  try {
-    await conn.beginTransaction();
-
-    const [[plan]] = await conn.execute(
-      `SELECT * FROM investment_plans WHERE id = ? AND user_id = ? FOR UPDATE`,
-      [planId, userId]
-    );
-    if (!plan) { await conn.rollback(); return fail(res, 'Plan not found.', 404); }
-    if (plan.status !== 'active' && plan.status !== 'approved') {
-      await conn.rollback();
-      return fail(res, `Plan is ${plan.status}. Payments only allowed when active or approved.`, 409);
-    }
-
-    const totalMonths = PLAN_MONTHS[plan.plan_type];
-    if (plan.months_paid >= totalMonths) {
-      await conn.rollback();
-      return fail(res, 'All instalments already paid.', 409);
-    }
-
-    if (plan.last_payment_date) {
-      const lastPaid = new Date(plan.last_payment_date);
-      const nextDue  = new Date(lastPaid);
-      nextDue.setMonth(nextDue.getMonth() + 1);
-      if (new Date() < nextDue) {
-        await conn.rollback();
-        const nextStr = nextDue.toISOString().slice(0, 10);
-        return fail(res, `Next payment allowed from ${nextStr}.`, 409);
-      }
-    }
-
-    const nextMonth = plan.months_paid + 1;
-
-    await conn.execute(
-      `INSERT INTO plan_instalments (plan_id, user_id, month_number, amount, utr_id, proof_image, status)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
-      [planId, userId, nextMonth, plan.monthly_amount, utr_id.trim(), proof_image || null]
-    );
-
-    await conn.execute(
-      `UPDATE investment_plans SET last_payment_date = CURDATE() WHERE id = ?`,
-      [planId]
-    );
-
-    await conn.commit();
-
-    createNotification(
-      userId,
-      'plan',
-      'Instalment Submitted',
-      `Month ${nextMonth} payment of ₹${Number(plan.monthly_amount).toLocaleString('en-IN')} has been submitted and is under review by admin.`
-    ).catch(e => console.error('[plan:payInstalment] notify error:', e.message));
-
-    return ok(res, `Month ${nextMonth} payment submitted. Pending admin approval.`, { month: nextMonth });
-  } catch (err) {
-    await conn.rollback();
-    console.error('[plan] payInstalment error:', err.message);
-    return fail(res, 'Payment failed: ' + err.message, 500);
   } finally {
     conn.release();
   }
@@ -862,7 +785,7 @@ async function withdrawPrincipal(req, res) {
 // been merged into "Approved". A plan's underlying DB status still becomes
 // 'active' internally once its 2nd instalment is approved (this is left
 // untouched so ROI accrual / payment-flow logic elsewhere — which already
-// treats 'approved' and 'active' as equivalent, e.g. payInstalment(),
+// treats 'approved' and 'active' as equivalent, e.g. maturePlanIfDue(),
 // accrueRoiForPlan() — keeps working exactly as before). Here we only change
 // what the Admin Panel *sees*: requesting status=approved returns both
 // 'approved' and 'active' rows, and any 'active' row's status is normalised
@@ -1110,7 +1033,10 @@ async function adminApproveInstalment(req, res) {
     const totalMonths  = PLAN_MONTHS[plan.plan_type];
     const newMonthsPaid = plan.months_paid + 1;
     const newPlanAmount = newMonthsPaid * Number(plan.monthly_amount);
-    const newStatus     = newMonthsPaid >= totalMonths ? 'completed' : 'active';
+    // One-time investment model: the single enrollment payment fully funds
+    // the plan. It only ever becomes 'completed' at maturity (see
+    // maturePlanIfDue()), never from a payment count reaching totalMonths.
+    const newStatus     = 'active';
 
     // ── Safety net ───────────────────────────────────────────────────────────
     // adminApprovePlan() is the normal path that sets start_date/maturity_date
@@ -1462,7 +1388,12 @@ async function accrueRoiForPlan(planId) {
   }
 
   const startDate = calendarToUtcMidnight(effectiveStartRaw);
-  const today = calendarToUtcMidnight(new Date());
+  // ROI is only earned for the plan's fixed duration — never past maturity,
+  // since the invested amount stops being "at work" once it matures and is
+  // credited back to the wallet.
+  const maturityUtc = plan.maturity_date ? calendarToUtcMidnight(plan.maturity_date) : null;
+  const rawToday = calendarToUtcMidnight(new Date());
+  const today = (maturityUtc && rawToday > maturityUtc) ? maturityUtc : rawToday;
 
   const msPerDay = 24 * 60 * 60 * 1000;
   const totalDays = Math.round((today - startDate) / msPerDay) + 1; // inclusive of today
@@ -1550,6 +1481,71 @@ async function accrueRoiForPlan(planId) {
   return creditedAmount;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MATURITY — automatic principal release
+//
+//  One-time investment model: the principal is paid once at enrollment and
+//  stays locked (cannot be withdrawn) for the entire plan duration. The
+//  moment today's date reaches maturity_date, the locked principal is
+//  credited back to the user's wallet automatically — no manual withdrawal
+//  action required. Safe to call repeatedly (cron + login catch-up): once
+//  plan_amount is zeroed and status is 'completed' the guard below makes
+//  every further call a no-op.
+// ═══════════════════════════════════════════════════════════════════════════════
+async function maturePlanIfDue(planId) {
+  const [[plan]] = await db.execute(`SELECT * FROM investment_plans WHERE id = ?`, [planId]);
+  if (!plan) return 0;
+  if (!['approved', 'active'].includes(plan.status)) return 0;
+  if (!plan.maturity_date) return 0;
+  if (Number(plan.plan_amount) <= 0) return 0;
+
+  const maturityUtc = calendarToUtcMidnight(plan.maturity_date);
+  const today = calendarToUtcMidnight(new Date());
+  if (today < maturityUtc) return 0;
+
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [[locked]] = await conn.execute(
+      `SELECT * FROM investment_plans WHERE id = ? FOR UPDATE`, [planId]
+    );
+    if (!locked || !['approved', 'active'].includes(locked.status) || Number(locked.plan_amount) <= 0) {
+      await conn.rollback();
+      return 0;
+    }
+
+    const principal = Number(locked.plan_amount);
+
+    await conn.execute(
+      `UPDATE users SET balance = balance + ? WHERE id = ?`,
+      [principal, locked.user_id]
+    );
+    await conn.execute(
+      `UPDATE investment_plans SET plan_amount = 0, status = 'completed' WHERE id = ?`,
+      [planId]
+    );
+
+    await conn.commit();
+
+    createNotification(
+      locked.user_id,
+      'plan',
+      'Principal Credited',
+      `Your ${planDisplayName(locked.plan_type)} has matured. The locked principal of ₹${principal.toLocaleString('en-IN')} has been credited to your wallet.`
+    ).catch(e => console.error('[plan:maturity] notify error:', e.message));
+
+    console.log(`[maturity] Plan #${planId}: matured, ₹${principal.toFixed(2)} principal credited to wallet.`);
+    return principal;
+  } catch (err) {
+    await conn.rollback();
+    console.error(`[maturity] Plan #${planId} auto-credit failed:`, err.message);
+    return 0;
+  } finally {
+    conn.release();
+  }
+}
+
 // ── Daily cron entry point ────────────────────────────────────────────────────
 async function runDailyRoi() {
   await ensureSchema();
@@ -1565,8 +1561,14 @@ async function runDailyRoi() {
 
     let credited = 0;
     for (const row of plans) {
+      // Accrue today's ROI first, THEN check maturity — so the plan's final
+      // day still earns its ROI before the principal is released and the
+      // plan moves to 'completed' (which halts further accrual).
       const amount = await accrueRoiForPlan(row.id);
       if (amount > 0) credited++;
+      await maturePlanIfDue(row.id).catch(err =>
+        console.error(`[maturity] cron check failed for plan #${row.id}:`, err.message)
+      );
     }
 
     console.log(`[roi-cron] ✅  Credited ROI to ${credited}/${plans.length} plan(s).`);
@@ -1585,7 +1587,6 @@ module.exports = {
   getMyPlans,
   getPlanAmount,
   enrollPlan,
-  payInstalment,
   withdrawRoi,
   withdrawPrincipal,
   adminListPlans,
@@ -1597,5 +1598,6 @@ module.exports = {
   runDailyRoi,
   backfillMissedRoi,
   accrueRoiForPlan,
+  maturePlanIfDue,
   ensureSchema,
 };
