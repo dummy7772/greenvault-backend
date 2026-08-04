@@ -210,6 +210,40 @@ function buildDailyRoiCreditEvents(planMap, dailyCreditRows) {
   return events;
 }
 
+/**
+ * Turns logged principal_credits rows into feed events — at most one event
+ * per plan, ever (UNIQUE(plan_id) on the table — see ensureSchema() /
+ * maturePlanIfDue() in planController.js). This is the one-time investment
+ * model's terminal event: the locked principal auto-credited to the wallet
+ * the moment the plan reached maturity.
+ */
+function buildPrincipalCreditEvents(planMap, principalCreditRows) {
+  const events = [];
+  for (const row of principalCreditRows) {
+    const plan = planMap[row.plan_id];
+    if (!plan) continue;
+    const planMonths = PLAN_MONTHS[plan.plan_type];
+    const planLabel  = planMonths ? `${planMonths} Month Plan` : 'Investment Plan';
+    const planName   = planMonths ? `${planMonths}M Investment Plan` : 'Investment Plan';
+
+    events.push({
+      id:        `principal_${row.id}`,
+      type:      'roi',
+      subtype:   'principal_credit',
+      title:     'Principal Credited',
+      subtitle:  `${planLabel} · Matured — To Wallet`,
+      plan_name: planName,
+      amount:    Number(row.amount),
+      is_credit: true,
+      status:    'approved',
+      plan_id:   String(plan.id),
+      plan_type: plan.plan_type,
+      date:      row.created_at,
+    });
+  }
+  return events;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/history/summary
 //
@@ -491,6 +525,7 @@ async function getRoiHistory(req, res) {
     const planIds = plans.map(p => p.id);
     let dailyCredits = [];
     let roiWithdrawals = [];
+    let principalCredits = [];
 
     if (planIds.length > 0) {
       const placeholders = planIds.map(() => '?').join(',');
@@ -524,6 +559,21 @@ async function getRoiHistory(req, res) {
         wdParams
       );
       roiWithdrawals = wdRows;
+
+      // ── 2c. Principal maturity credits for those plans ────────────────────
+      let pcClause = `WHERE plan_id IN (${placeholders})`;
+      const pcParams = [...planIds];
+      if (from) { pcClause += ' AND DATE(created_at) >= ?'; pcParams.push(from); }
+      if (to)   { pcClause += ' AND DATE(created_at) <= ?'; pcParams.push(to);   }
+
+      const [pcRows] = await db.execute(
+        `SELECT id, plan_id, amount, created_at
+           FROM principal_credits
+           ${pcClause}
+           ORDER BY created_at DESC`,
+        pcParams
+      );
+      principalCredits = pcRows;
     }
 
     // ── 3. Build plan lookup map ──────────────────────────────────────────
@@ -546,6 +596,10 @@ async function getRoiHistory(req, res) {
     // covers any pre-log withdrawn_roi that hasn't been materialised yet.
     const withdrawalEvents = buildRoiWithdrawalEvents(plans, planMap, roiWithdrawals);
     events.push(...withdrawalEvents);
+
+    // 4c. Principal credited back to wallet at maturity — one event per
+    // plan, ever (see buildPrincipalCreditEvents docblock above).
+    events.push(...buildPrincipalCreditEvents(planMap, principalCredits));
 
     // ── 5. Sort newest first, then paginate ───────────────────────────────
     events.sort((a, b) => new Date(b.date) - new Date(a.date));
@@ -778,6 +832,28 @@ async function buildUnifiedHistory(userId, query) {
           );
 
           for (const ev of buildRoiWithdrawalEvents(plans, planMap, roiWdRows)) {
+            if (search && search.trim() && !ev.subtitle.toLowerCase().includes(search.toLowerCase())) continue;
+            allEvents.push(ev);
+          }
+        }
+
+        // Principal credited back to wallet at maturity — one event per
+        // plan, ever (one-time investment model's terminal event).
+        if (!status || status === 'approved') {
+          const pcClause = [`plan_id IN (${ph})`];
+          const pcParams = [...planIds];
+          if (from) { pcClause.push('DATE(created_at) >= ?'); pcParams.push(from); }
+          if (to)   { pcClause.push('DATE(created_at) <= ?'); pcParams.push(to);   }
+
+          const [pcRows] = await db.execute(
+            `SELECT id, plan_id, amount, created_at
+               FROM principal_credits
+              WHERE ${pcClause.join(' AND ')}
+              ORDER BY created_at DESC LIMIT 200`,
+            pcParams
+          );
+
+          for (const ev of buildPrincipalCreditEvents(planMap, pcRows)) {
             if (search && search.trim() && !ev.subtitle.toLowerCase().includes(search.toLowerCase())) continue;
             allEvents.push(ev);
           }
