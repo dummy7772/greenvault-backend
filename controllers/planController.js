@@ -181,6 +181,30 @@ async function _runSchemaMigration() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
 
+    // ── principal_credits ────────────────────────────────────────────────
+    // One-time investment model: the principal is locked for the entire
+    // plan duration and is never withdrawable by the user directly. The
+    // moment a plan matures, maturePlanIfDue() credits the locked principal
+    // back to the user's wallet automatically and logs that event here —
+    // exactly one row per plan, ever. Without this table, that credit only
+    // ever showed up as a notification; it never appeared as its own entry
+    // in Transaction History / the ROI tab, so the wallet ledger looked
+    // incomplete the moment a plan matured.
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS principal_credits (
+        id          INT UNSIGNED NOT NULL AUTO_INCREMENT,
+        plan_id     INT UNSIGNED NOT NULL,
+        user_id     INT UNSIGNED NOT NULL,
+        amount      DECIMAL(15,2) NOT NULL,
+        created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uniq_principal_credit_plan (plan_id),
+        KEY idx_principal_credit_user (user_id),
+        CONSTRAINT fk_principal_credit_plan FOREIGN KEY (plan_id) REFERENCES investment_plans (id) ON DELETE CASCADE,
+        CONSTRAINT fk_principal_credit_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
     // ── Reconcile legacy ROI withdrawals (self-healing) ────────────────────
     // Each plan may have at most ONE "legacy" row, sized so that:
     //   sum(non-legacy rows) + legacy row = plan.withdrawn_roi (exactly)
@@ -346,7 +370,7 @@ function calendarToUtcMidnight(d) {
   return new Date(Date.UTC(x.getFullYear(), x.getMonth(), x.getDate()));
 }
 
-async function buildPlanPayload(plan, instalments, roiWithdrawals, dailyRoiCredits) {
+async function buildPlanPayload(plan, instalments, roiWithdrawals, dailyRoiCredits, principalCredit) {
   const loggedWithdrawals = (roiWithdrawals || []).map(w => ({
     id:         String(w.id),
     amount:     Number(w.amount),
@@ -434,6 +458,17 @@ async function buildPlanPayload(plan, instalments, roiWithdrawals, dailyRoiCredi
       status:       'Success',
     })),
     daily_roi_credit_count: (dailyRoiCredits || []).length,
+    // ── Principal maturity credit ───────────────────────────────────────
+    // One-time investment model: the invested principal is locked for the
+    // whole plan duration and is never withdrawn manually. When the plan
+    // matures, maturePlanIfDue() auto-credits it to the wallet and logs it
+    // in principal_credits (see ensureSchema()). Exposed here so the app
+    // can show a "Principal Credited" entry in Transaction History and a
+    // completed badge on the Plan Details screen — null until that happens.
+    principal_credited_amount: principalCredit ? Number(principalCredit.amount) : null,
+    principal_credited_at: principalCredit && principalCredit.created_at
+      ? principalCredit.created_at.toISOString()
+      : null,
   };
 }
 
@@ -483,7 +518,11 @@ async function getMyPlans(req, res) {
         `SELECT * FROM roi_daily_credits WHERE plan_id = ? ORDER BY credit_date DESC`,
         [plan.id]
       );
-      results.push(await buildPlanPayload(plan, ins, roiWds, dailyCredits));
+      const [[principalCredit]] = await db.execute(
+        `SELECT * FROM principal_credits WHERE plan_id = ? LIMIT 1`,
+        [plan.id]
+      );
+      results.push(await buildPlanPayload(plan, ins, roiWds, dailyCredits, principalCredit));
     }
     return ok(res, 'Plans fetched', results);
   } catch (err) {
@@ -600,7 +639,7 @@ async function enrollPlan(req, res) {
       userId,
       'plan',
       'Investment Plan Submitted',
-      `Your ${planType.replace('_', '-')} investment plan enrollment (₹${amount.toLocaleString('en-IN')}/month) has been submitted and is under review by admin.`
+      `Your ${planType.replace('_', '-')} investment plan enrollment (one-time payment of ₹${amount.toLocaleString('en-IN')}) has been submitted and is under review by admin.`
     ).catch(e => console.error('[plan:enroll] notify error:', e.message));
 
     if (isFirstEverPlan) {
@@ -756,6 +795,10 @@ async function withdrawPrincipal(req, res) {
       `UPDATE investment_plans SET plan_amount = 0 WHERE id = ?`,
       [planId]
     );
+    await conn.execute(
+      `INSERT IGNORE INTO principal_credits (plan_id, user_id, amount) VALUES (?, ?, ?)`,
+      [planId, userId, principal]
+    );
 
     await conn.commit();
 
@@ -817,7 +860,11 @@ async function adminListPlans(req, res) {
         `SELECT * FROM plan_instalments WHERE plan_id = ? ORDER BY month_number ASC`,
         [plan.id]
       );
-      const payload = await buildPlanPayload(plan, ins);
+      const [[principalCredit]] = await db.execute(
+        `SELECT * FROM principal_credits WHERE plan_id = ? LIMIT 1`,
+        [plan.id]
+      );
+      const payload = await buildPlanPayload(plan, ins, [], [], principalCredit);
       // Display-only normalisation — see comment above. The DB row itself
       // (and every other endpoint that reads plan.status) is untouched.
       if (payload.status === 'active') payload.status = 'approved';
@@ -1104,11 +1151,11 @@ async function adminApproveInstalment(req, res) {
     createNotification(
       plan.user_id,
       'plan',
-      'Instalment Approved',
-      `Month ${ins.month_number} payment of ₹${Number(ins.amount).toLocaleString('en-IN')} has been approved.${newStatus === 'completed' ? ' Your plan is now complete!' : ''}`
+      'Payment Approved',
+      `Your investment payment of ₹${Number(ins.amount).toLocaleString('en-IN')} has been approved.${newStatus === 'completed' ? ' Your plan is now complete!' : ' Your plan is now active and earning daily ROI.'}`
     ).catch(e => console.error('[plan:instalment:approve] notify error:', e.message));
 
-    return ok(res, `Month ${ins.month_number} payment approved. Plan status: ${newStatus}.`, {
+    return ok(res, `Payment approved. Plan status: ${newStatus}.`, {
       months_paid: newMonthsPaid,
       plan_status: newStatus,
     });
@@ -1153,12 +1200,12 @@ async function adminRejectInstalment(req, res) {
       createNotification(
         insPlan.user_id,
         'plan',
-        'Instalment Rejected',
-        `Month ${ins.month_number} payment of ₹${Number(ins.amount).toLocaleString('en-IN')} was rejected.${reason ? ` Reason: ${reason}` : ''}`
+        'Payment Rejected',
+        `Your investment payment of ₹${Number(ins.amount).toLocaleString('en-IN')} was rejected.${reason ? ` Reason: ${reason}` : ''}`
       ).catch(e => console.error('[plan:instalment:reject] notify error:', e.message));
     }
 
-    return ok(res, 'Instalment payment rejected.');
+    return ok(res, 'Payment rejected.');
   } catch (err) {
     await conn.rollback();
     console.error('[plan] adminRejectInstalment error:', err.message);
@@ -1524,6 +1571,14 @@ async function maturePlanIfDue(planId) {
     await conn.execute(
       `UPDATE investment_plans SET plan_amount = 0, status = 'completed' WHERE id = ?`,
       [planId]
+    );
+    // Log this credit so it can be surfaced as its own "Principal Credited"
+    // entry in Transaction History / the ROI tab (see buildPlanPayload()).
+    // UNIQUE(plan_id) guarantees exactly one row per plan even if this
+    // function is somehow invoked twice for the same maturity event.
+    await conn.execute(
+      `INSERT IGNORE INTO principal_credits (plan_id, user_id, amount) VALUES (?, ?, ?)`,
+      [planId, locked.user_id, principal]
     );
 
     await conn.commit();
